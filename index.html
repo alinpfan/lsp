@@ -1,0 +1,221 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>SPIKE Prime Web Bluetooth</title>
+  <style>
+    body { font-family: sans-serif; max-width: 720px; margin: 2rem auto; }
+    #log { white-space: pre-wrap; border: 1px solid #ccc; padding: 1rem; height: 400px; overflow: auto; font-family: monospace; font-size: 12px; }
+    button { margin: 5px; padding: 8px 16px; }
+    input { padding: 8px; width: 200px; }
+  </style>
+</head>
+<body>
+  <h2>SPIKE Prime NUS Test</h2>
+  <button id="connect">Connect</button>
+  <button id="disconnect">Disconnect</button>
+  <br><br>
+  <input id="msg" placeholder="Type message..." />
+  <button id="send">Send</button>
+  <button id="clear">Clear Log</button>
+  <div id="log"></div>
+
+<script>
+const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const NUS_RX      = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // write to hub
+const NUS_TX      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // notifications from hub
+
+// Pybricks vendor service (might be needed for proper operation)
+const PYBRICKS_SERVICE = 'c5f50001-8280-46da-89f4-6d8051e4aeef';
+
+let device, server, rxChar, txChar;
+let inBuf = '';
+
+const logEl = document.querySelector('#log');
+const log = (s) => { 
+  const time = new Date().toLocaleTimeString('en-US', {hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3});
+  logEl.textContent += `[${time}] ${s}\n`; 
+  logEl.scrollTop = logEl.scrollHeight;
+};
+
+document.querySelector('#clear').addEventListener('click', () => {
+  logEl.textContent = '';
+});
+
+document.querySelector('#disconnect').addEventListener('click', async () => {
+  if (device && device.gatt.connected) {
+    device.gatt.disconnect();
+    log('Disconnected');
+  }
+  device = null;
+  server = null;
+  rxChar = null;
+  txChar = null;
+});
+
+document.querySelector('#connect').addEventListener('click', async () => {
+  try {
+    log('Requesting device...');
+    
+    // Use acceptAllDevices since Pybricks may not advertise NUS service UUID
+    device = await navigator.bluetooth.requestDevice({
+      acceptAllDevices: true,
+      optionalServices: [
+        NUS_SERVICE,
+        PYBRICKS_SERVICE,
+        'device_information',
+        'battery_service',
+      ],
+    });
+    
+    log(`Selected: ${device.name || device.id}`);
+    
+    // Handle disconnection
+    device.addEventListener('gattserverdisconnected', () => {
+      log('⚠️ Device disconnected!');
+      rxChar = null;
+      txChar = null;
+    });
+
+    log('Connecting to GATT server...');
+    server = await device.gatt.connect();
+    log('✓ GATT connected');
+    
+    // List all services for debugging
+    log('Discovering services...');
+    const services = await server.getPrimaryServices();
+    log(`Found ${services.length} services:`);
+
+    for (const s of services) {
+      log(` SVC: ${s.uuid}`);
+      try {
+        const chars = await s.getCharacteristics();
+        for (const c of chars) {
+          const p = c.properties;
+          const props = [];
+          if (p.notify) props.push('notify');
+          if (p.indicate) props.push('indicate');
+          if (p.write) props.push('write');
+          if (p.writeWithoutResponse) props.push('writeNR');
+          if (p.read) props.push('read');
+          log(`   CHR: ${c.uuid} [${props.join(', ')}]`);
+        }
+      } catch (e) {
+        log(`   (could not enumerate characteristics: ${e.message})`);
+      }
+    }
+
+    // Get NUS service
+    log('Getting NUS service...');
+    const nusService = await server.getPrimaryService(NUS_SERVICE);
+    
+    // Get characteristics
+    rxChar = await nusService.getCharacteristic(NUS_RX);
+    txChar = await nusService.getCharacteristic(NUS_TX);
+    log('✓ NUS characteristics obtained');
+    log(`  RX (write to hub): ${NUS_RX}`);
+    log(`  TX (notify from hub): ${NUS_TX}`);
+
+    // Set up notification handler BEFORE starting notifications
+    log('Setting up notification handler...');
+    txChar.addEventListener('characteristicvaluechanged', handleNotification);
+
+    // Start notifications
+    log('Starting notifications...');
+    await txChar.startNotifications();
+    log('✓ Notifications started - listening for data...');
+    
+    // Also log the characteristic's value property in case there's initial data
+    if (txChar.value) {
+      log(`Initial value present: ${txChar.value.byteLength} bytes`);
+    }
+
+    log('');
+    log('=== READY ===');
+    log('Hub should be sending "ready" every second if program is running.');
+    log('If no data appears, ensure:');
+    log('  1. Hub program is running (not just uploaded)');
+    log('  2. No other app is connected (close pybricks.com)');
+    log('  3. Try sending "ping" to trigger a response');
+    log('');
+
+  } catch (err) {
+    log(`❌ ERROR: ${err.message}`);
+    console.error(err);
+  }
+});
+
+function handleNotification(event) {
+  const value = event.target.value;
+  const bytes = new Uint8Array(value.buffer);
+  
+  // Log raw hex for debugging
+  const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join(' ');
+  log(`📥 RAW [${bytes.length} bytes]: ${hex}`);
+  
+  // Try to decode as text
+  try {
+    const chunk = new TextDecoder('utf-8').decode(bytes);
+    log(`   TEXT: "${chunk.replace(/\n/g, '\\n').replace(/\r/g, '\\r')}"`);
+    
+    inBuf += chunk;
+    let idx;
+    while ((idx = inBuf.indexOf('\n')) >= 0) {
+      const line = inBuf.slice(0, idx).replace(/\r$/, ''); // Handle \r\n
+      inBuf = inBuf.slice(idx + 1);
+      log(`   📨 RX: ${line}`);
+    }
+  } catch (decodeErr) {
+    log(`   Decode error: ${decodeErr.message}`);
+  }
+}
+
+document.querySelector('#send').addEventListener('click', async () => {
+  const text = document.querySelector('#msg').value;
+  if (!text) return log('Nothing to send');
+  if (!rxChar) return log('Not connected - click Connect first');
+  
+  try {
+    await writeTextLine(text);
+    log(`📤 TX: ${text}`);
+    document.querySelector('#msg').value = '';
+  } catch (err) {
+    log(`❌ Send error: ${err.message}`);
+  }
+});
+
+// Also allow Enter key to send
+document.querySelector('#msg').addEventListener('keypress', (e) => {
+  if (e.key === 'Enter') {
+    document.querySelector('#send').click();
+  }
+});
+
+async function writeTextLine(line) {
+  const data = new TextEncoder().encode(line + "\n");
+  const CHUNK = 20; // Safe BLE chunk size
+
+  for (let i = 0; i < data.length; i += CHUNK) {
+    const part = data.slice(i, i + CHUNK);
+    // Prefer writeValueWithoutResponse for NUS
+    if (rxChar.properties.writeWithoutResponse) {
+      await rxChar.writeValueWithoutResponse(part);
+    } else {
+      await rxChar.writeValue(part);
+    }
+  }
+}
+
+// Check if we're on HTTPS or localhost
+if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
+  log('⚠️ WARNING: Web Bluetooth requires HTTPS or localhost!');
+  log(`Current: ${location.protocol}//${location.hostname}`);
+  log('');
+}
+
+log('Page loaded. Click "Connect" to start.');
+log('Make sure your hub program is RUNNING (not just uploaded).');
+log('');
+</script>
+</body>
+</html>
