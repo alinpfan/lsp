@@ -1,0 +1,46 @@
+<button id="connect">Connect</button>
+<input id="msg" placeholder="text">
+<button id="send">Send</button>
+<pre id="log"></pre>
+
+<script>
+const SVC  = 'c5f50001-8280-46da-89f4-6d8051e4aeef'; // Pybricks service [page:0]
+const CHR  = 'c5f50002-8280-46da-89f4-6d8051e4aeef'; // command/event char [page:0]
+const WSTDOUT = 0x01; // WRITE_STDOUT event [page:0]
+const WSTDIN  = 0x06; // WRITE_STDIN command [page:0]
+
+let ch, buf = '';
+const log = (s) => (document.querySelector('#log').textContent += s + '\n');
+
+document.querySelector('#connect').onclick = async () => {
+  const dev = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: [SVC] });
+  const srv = await dev.gatt.connect();
+  ch = await (await srv.getPrimaryService(SVC)).getCharacteristic(CHR);
+
+  ch.addEventListener('characteristicvaluechanged', (e) => {
+    const b = new Uint8Array(e.target.value.buffer);
+    if (b[0] !== WSTDOUT) return;
+    buf += new TextDecoder().decode(b.slice(1));
+    for (;;) {
+      const i = buf.indexOf('\n');
+      if (i < 0) break;
+      log('RX: ' + buf.slice(0, i).replace(/\r$/, ''));
+      buf = buf.slice(i + 1);
+    }
+  });
+
+  await ch.startNotifications();
+  log('Connected. Start hub program (should print "ready").');
+};
+
+document.querySelector('#send').onclick = async () => {
+  if (!ch) return log('Not connected');
+  const text = document.querySelector('#msg').value;
+  const payload = new TextEncoder().encode(text + '\n');
+  const pkt = new Uint8Array(1 + payload.length);
+  pkt[0] = WSTDIN;          // command type [page:0]
+  pkt.set(payload, 1);
+  await ch.writeValue(pkt); // write command to characteristic [page:0]
+  log('TX: ' + text);
+};
+</script>
